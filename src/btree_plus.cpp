@@ -1,9 +1,9 @@
+#include <fmt/core.h>
 #include <array>
 #include <vector>
 #include <cassert>
 #include <stdexcept>
 #include <variant>
-#include <cstdio>
 #include <algorithm>
 #include <string>
 
@@ -46,11 +46,18 @@ public:
         do_dump(root, "");
     }
 
+    bool erase(const Key &key) {
+        if (root->empty())
+            return false;
+        auto fake_key = key;
+        return do_erase(root, key, fake_key);
+    }
+
     ~btree_plus() {
         do_delete(root);
     }
 
-private:
+protected:
     struct page;
     using internal_page = page*;
     using external_page_offset = unsigned;
@@ -108,7 +115,7 @@ private:
             return std::get<internal_page>(get_child(i));
         }
 
-        Data *get_data(unsigned i) noexcept {
+        Data *get_data(unsigned i) const {
             auto &data = offsets;
             return std::get_if<Data>(&data[i]->value);
         }
@@ -137,12 +144,10 @@ private:
     };
 
     page *root;
-    unsigned short binary_search_threshold = fanout/2;
-    unsigned short memory_limit_mb = 512u;
 
-    const Data *do_search(page *node, const Key &key) const noexcept {
+    const Data *do_search(const page *node, const Key &key) const noexcept {
         if (debug)
-            printf("do_search: %u\n", key);
+            fmt::print("do_search: {}\n", key);
         auto size = node->size();
         auto &data = node->offsets;
         // data are sorted
@@ -150,14 +155,14 @@ private:
             // for now just naive scan
             auto i = 0u;
             for (; (i < size) && (key > data[i]->key); i++) {}
-            if (i < size) {
-                assert(key <= data[i]->key);
-                if (node->is_leaf() && data[i]->key == key) {
-                     return node->get_data(i);
-                } else if (!node->is_leaf() && !node->empty()) {
-                    auto next_page = read(node->get_internal_child(i));
-                    return next_page? do_search(next_page, key) : nullptr;
-                }
+            if (i >= size)
+                return nullptr;
+            assert(key <= data[i]->key);
+            if (node->is_leaf() && data[i]->key == key) {
+                return node->get_data(i);
+            } else if (!node->is_leaf() && !node->empty()) {
+                auto next_page = read(node->get_internal_child(i));
+                return next_page? do_search(next_page, key) : nullptr;
             }
             return nullptr;
         } else {
@@ -167,7 +172,7 @@ private:
                 return cell_pointer->key;
             });
             assert(it != data.end());
-            auto i = std::ranges::distance(data.begin(), it);
+            auto i = static_cast<unsigned>(std::ranges::distance(data.begin(), it));
             if (data[i]->key == key) {
                 return node->get_data(i);
             } else {
@@ -179,7 +184,7 @@ private:
 
     void do_insert(page *node, const Key &key, const Data &value) {
         if (debug)
-            printf("do_insert: %u\n", key);
+            fmt::print("do_insert: {}\n", key);
         auto &data = node->offsets;
         auto i = node->size();
         if (node->is_leaf()) {
@@ -207,12 +212,10 @@ private:
         }
     }
     // x - parent of full y, right half of y is moved to z - new child of x
-    page* split_child(page *x, unsigned i, page *y) {
+    page* split_child(page *x, unsigned i, page *y, unsigned half = fanout/2) {
         if (debug)
-            printf("split_child index: %u\n", i);
-
+            fmt::print("split_child index: {}\n", i);
         auto z = allocate_page(y->is_leaf());
-        auto half = fanout/2u;
         z->header.cells_size = 0;
         auto &x_data = x->offsets;
         auto &z_data = z->offsets;
@@ -235,13 +238,18 @@ private:
         return z;
     }
 
+    page *merge_child(page *parent, page *x, page *y) {
+        if (debug)
+            fmt::print("merge_child: not implemented yet\n");
+        return nullptr;
+    }
     void do_dump(page *node, std::string str) const {
         using namespace std::string_literals;
-        printf("%s %p: leaf = %d\n", str.c_str(), (void*)node, node->is_leaf());
+        fmt::print("{} {}: leaf = {}\n", str.c_str(), static_cast<void*>(node), node->is_leaf());
         str += "  "s;
         for (auto i = 0u; i < node->size(); i++) {
             auto &data = node->offsets;
-            printf("%s key = %u\n", str.c_str(), data[i]->key);
+            fmt::print("{} key = {}\n", str.c_str(), data[i]->key);
             if (!node->is_leaf())
                 do_dump(node->get_internal_child(i), str);
         }
@@ -255,6 +263,49 @@ private:
         delete node;
     }
 
+    bool do_erase(page *node, const Key &key, Key &parent_key) {
+        if (debug)
+            fmt::print("do_erase: {}\n", key);
+        auto size = node->size();
+        auto &data = node->offsets;
+        if (size < binary_search_threshold) [[likely]] {
+            auto i = 0u;
+            for (; (i < size) && (key > data[i]->key); i++) {}
+            if (i >= size)
+                return false;
+            assert(key <= data[i]->key);
+            if (node->is_leaf() && key == data[i]->key) {
+                for (auto j = i; j < size; j++) {
+                    data[j] = data[j+1];
+                }
+                node->header.cells_size--;
+                if (0 < i && i-1 < node->size())
+                    parent_key = data[i-1]->key;
+                return true;
+            } else if (!node->is_leaf()) {
+                auto next_page = read(node->get_internal_child(i));
+                if (!next_page)
+                    return false;
+                auto &mutable_key = node->offsets[i]->key;
+                auto erased = do_erase(next_page, key, mutable_key);
+                // maybe merge, fixme
+#if 0
+                if (erased) {
+                    auto right_page = node->get_internal_child(i);
+                    if (next_page->size() + right_page->size() <= fanout) {
+                        merge_child(node, next_page, right_page);
+                    }
+                }
+#endif
+                return erased;
+            }
+            return false;
+        } else {
+            assert(false);
+        }
+        return false;
+    }
+
     page *allocate_page(bool leaf) {
         auto new_page = new page;
         new_page->leaf = leaf;
@@ -264,7 +315,7 @@ private:
     static page *read(external_page_offset offset) {
         // page may be already in memory, do fseek
         if (debug)
-            printf("read: not implemented yet\n");
+            fmt::print("read: not implemented yet\n");
         return nullptr;
     }
 
@@ -274,19 +325,24 @@ private:
 
     static void write(const page &p) {
         if (debug)
-            printf("write: not implemented yet\n");
+            fmt::print("write: not implemented yet\n");
     }
 public:
     constexpr static auto fanout = debug? artificial_fanout : std::min(offsets_capacity,
                                           std::min(cells_capacity, availibility_list_capacity));
+private:
+    constexpr static unsigned short binary_search_threshold = fanout/2;
+    constexpr static unsigned short memory_limit_mb = 512u;
 };
 
 static_assert(btree_plus<unsigned, unsigned>::fanout == 63u ||
     btree_plus<unsigned, unsigned>::fanout == artificial_fanout);
 // static_asserts + trivially_copyable + standard_layut + no padding stuff (concepts?)
 
+template class btree_plus<unsigned, std::string>; // for gdb
+
 static auto test_basic_insert_search1() {
-    printf("%s\n", __PRETTY_FUNCTION__);
+    fmt::print("{}\n", __PRETTY_FUNCTION__);
     btree_plus<unsigned, std::string> tree;
     assert(tree.search(1) == nullptr);
     tree.insert(1, "1");
@@ -299,7 +355,7 @@ static auto test_basic_insert_search1() {
 }
 
 static auto test_basic_insert_search2() {
-    printf("%s\n", __PRETTY_FUNCTION__);
+    fmt::print("{}\n", __PRETTY_FUNCTION__);
     btree_plus<unsigned, std::string> tree;
     assert(tree.search(1) == nullptr);
     tree.insert(2, "2");
@@ -321,7 +377,7 @@ static auto test_basic_insert_search2() {
 }
 
 static auto test_basic_insert_search3() {
-    printf("%s\n", __PRETTY_FUNCTION__);
+    fmt::print("{}\n", __PRETTY_FUNCTION__);
     btree_plus<unsigned, std::string> tree;
     assert(tree.search(3) == nullptr);
     tree.insert(3, "3");
@@ -335,7 +391,7 @@ static auto test_basic_insert_search3() {
 
 // provokes split_child
 static auto test_inserts_with_full_leaf() {
-    printf("%s\n", __PRETTY_FUNCTION__);
+    fmt::print("{}\n", __PRETTY_FUNCTION__);
     btree_plus<unsigned, std::string> tree;
     for (auto i = 0u; i < 32u; i++) {
         tree.insert(i, std::to_string(i));
@@ -343,11 +399,46 @@ static auto test_inserts_with_full_leaf() {
     tree.dump();
 }
 
+static auto test_basic_insert_erase1() {
+    fmt::print("{}\n", __PRETTY_FUNCTION__);
+    btree_plus<unsigned, std::string> tree;
+    assert(tree.search(1) == nullptr);
+    tree.insert(1, "1");
+    assert(*tree.search(1) == "1");
+    tree.insert(2, "2");
+    assert(*tree.search(2) == "2");
+    assert(tree.erase(2));
+    tree.dump();
+    assert(tree.search(2) == nullptr);
+    assert(tree.erase(1));
+    assert(tree.search(0) == nullptr);
+    tree.dump();
+}
+
+template<class Key = unsigned, class Data = unsigned>
+class btree_plus_test : public btree_plus<Key, Data> {
+public:
+    void test_splits_and_merges() {
+        fmt::print("{}\n", __PRETTY_FUNCTION__);
+        auto &root = this->root;
+        this->insert(1u, 1u);
+        this->insert(2u, 2u);
+        this->insert(3u, 3u);
+        this->insert(4u, 4u);
+        this->insert(5u, 5u);
+        this->insert(6u, 6u);
+        this->split_child(root, 0, root->get_internal_child(0), 3u);
+        this->dump();
+    }
+};
+
 int main() {
     test_basic_insert_search1();
     test_basic_insert_search2();
     test_basic_insert_search3();
     test_inserts_with_full_leaf();
-    printf("OK\n");
+    test_basic_insert_erase1();
+    btree_plus_test<>{}.test_splits_and_merges();
+    fmt::print("OK\n");
     return 0;
 }
