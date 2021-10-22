@@ -94,6 +94,7 @@ protected:
         std::array<cell_ptr, offsets_capacity> offsets;
         std::array<cell, cells_capacity> cells;
         std::array<cell_ptr, availibility_list_capacity> availibility_list;
+        unsigned current_idx;
         bool leaf;
 
         bool full() const noexcept {
@@ -132,23 +133,42 @@ protected:
             return std::get_if<Data>(&data[i]->value);
         }
 
+        cell_ptr get_cell() {
+            if (!current_idx) {
+                if (debug)
+                    fmt::print("set_internal: full page\n");
+                return nullptr;
+            }
+            return availibility_list[--current_idx];
+        }
+
         void set_internal(unsigned i, const Key &key, const Data &data) {
-            offsets[i] = &cells[header.cells_size++];
+            auto ptr = get_cell();
+            header.cells_size++;
+            offsets[i] = ptr;
             offsets[i]->key = key;
             offsets[i]->value = data;
         }
 
         void set_external(unsigned i, const Key &key, const internal_page page_) {
-            offsets[i] = &cells[header.cells_size++];
+            auto ptr = get_cell();
+            header.cells_size++;
+            offsets[i] = ptr;
             offsets[i]->key = key;
             offsets[i]->value = page_;
         }
 
         void set(unsigned i, const Key &key, const std::variant<Data, page_ptr> &value) {
-            // FIXME: next cell is not right one - it could be used in past. Use availibility_list!
-            offsets[i] = &cells[header.cells_size++];
+            auto ptr = get_cell();
+            header.cells_size++;
+            offsets[i] = ptr;
             offsets[i]->key = key;
             offsets[i]->value = value;
+        }
+
+        void remove(unsigned i) {
+            availibility_list[current_idx++] = offsets[i];
+            header.cells_size--;
         }
 
         unsigned size() const noexcept {
@@ -230,7 +250,6 @@ protected:
         if (debug)
             fmt::print("split_child index: {}\n", i);
         auto z = allocate_page(y->is_leaf());
-        z->header.cells_size = 0;
         auto &x_data = x->offsets;
         auto &z_data = z->offsets;
         auto &y_data = y->offsets;
@@ -239,9 +258,11 @@ protected:
             auto ptr = y_data[j + half];
             z->set(j, ptr->key, ptr->value);
         }
-        // no need to remove upper half from list
-        y->header.cells_size = half;
-        for (auto j = x->header.cells_size; j >= i + 1; j--) {
+        // remove upper half from list
+        for (auto i = 0u; i < half; i++) {
+             y->remove(half + i);
+        }
+        for (auto j = x->size(); j >= i + 1; j--) {
             x_data[j+1] = x_data[j];
         }
         x->set(i+1, z_data[half - 1]->key, z);
@@ -257,8 +278,8 @@ protected:
             fmt::print("merge_child index: {}\n", i);
         if (x != y) {
             auto &y_data = y->offsets;
-            auto offset = x->header.cells_size;
-            for (auto j = 0u; j < y->header.cells_size; j++) {
+            auto offset = x->size();
+            for (auto j = 0u; j < y->size(); j++) {
                 auto ptr = y_data[j];
                 x->set(j + offset, ptr->key, ptr->value);
             }
@@ -268,18 +289,18 @@ protected:
         if (right) {
             if (i + 1 < parent->size())
                 pdata[i]->key = pdata[i+1]->key;
-            for (auto j = i+1; j < parent->header.cells_size - 1; j++) {
+            for (auto j = i+1; j < parent->size() - 1; j++) {
                 pdata[j] = pdata[j+1];
             }
         } else {
             if (i > 0)
                 pdata[i-1]->key = pdata[i]->key;
-            for (auto j = i; j < parent->header.cells_size - 1; j++) {
+            for (auto j = i; j < parent->size() - 1; j++) {
                 pdata[j] = pdata[j+1];
             }
         }
         delete y;
-        parent->header.cells_size--;
+        parent->remove(i);
         return nullptr;
     }
 
@@ -315,10 +336,10 @@ protected:
                 return false;
             assert(key <= data[i]->key);
             if (node->is_leaf() && key == data[i]->key) {
+                node->remove(i);
                 for (auto j = i; j < size; j++) {
                     data[j] = data[j+1];
                 }
-                node->header.cells_size--;
                 if (0 < i && i-1 < node->size() && key == parent_key)
                     parent_key = data[i-1]->key;
                 return true;
@@ -326,7 +347,7 @@ protected:
                 auto next_page = read(node->get_internal_child(i));
                 if (!next_page)
                     return false;
-                auto &mutable_key = node->offsets[i]->key;
+                auto &mutable_key = data[i]->key;
                 auto erased = do_erase(next_page, key, mutable_key);
                 if (!erased)
                     return false;
@@ -342,7 +363,7 @@ protected:
                 }
                 if (!left_page && !right_page) {
                     if (node->size() == 1 && next_page->empty()) {
-                        node->header.cells_size--;
+                        node->remove(i);
                         delete next_page;
                     }
                 }
@@ -358,6 +379,9 @@ protected:
     page *allocate_page(bool leaf) {
         auto new_page = new page;
         new_page->leaf = leaf;
+        new_page->current_idx = cells_capacity;
+        for (auto i = new_page->current_idx; i--> 0u; )
+            new_page->availibility_list[i] = &new_page->cells[i];
         return new_page;
     }
 
@@ -493,7 +517,6 @@ static auto test_inserts_with_erases_remove_tree(unsigned start) {
     }
     tree.dump();
     // remove from most left page, merge with left
-    // FIXME: with start=3 erase "clone" existing cell
     for (auto i = start; i--> 0u;) {
         tree.erase(i);
     }
@@ -503,7 +526,15 @@ static auto test_inserts_with_erases_remove_tree(unsigned start) {
         tree.erase(i);
     }
     tree.dump();
-    assert((start == 4u)? tree.empty() : !tree.empty() );
+    if (start == 4u) {
+        assert(tree.empty());
+        assert(tree.search(3u) == nullptr);
+        assert(tree.search(4u) == nullptr);
+    } else {
+        assert(!tree.empty());
+        assert(*tree.search(3u) == "3");
+        assert(tree.search(4u) == nullptr);
+    }
 }
 
 int main() {

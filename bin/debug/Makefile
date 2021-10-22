@@ -17,10 +17,8 @@ gcc: ../../src/btree_plus.cpp
 clean:
 	@- $(RM) btree btree_cl
 
-
 tidy:
-	clang-tidy ../../src/btree_plus.cpp
-
+	clang-tidy ../../src/btree_plus.cpp -p compile_commands.json
 heavy: 
 	make CXXFLAGS='-Wall -W -Wextra -Wpedantic -g -std=c++20 -fcoroutines-ts' clang && \
                 valgrind --tool=helgrind ./btree_cl && valgrind --tool=memcheck --leak-check=yes --show-reachable=yes --num-callers=20 --track-fds=yes --expensive-definedness-checks=yes ./btree_cl 
