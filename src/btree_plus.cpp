@@ -6,6 +6,8 @@
 #include <variant>
 #include <algorithm>
 #include <string>
+#include <map>
+#include <random>
 
 // ref: Database_Internals_-_Alex_Petrov.pdf
 
@@ -33,10 +35,9 @@ public:
             do_insert(new_child, key, data);
         } else if (r->full()) {
             auto new_root = allocate_page(false);
-            r->leaf = true;
-            r = new_root;
-            split_child(new_root, 1u, r);
-            do_insert(new_root, key, data);
+            split_child(new_root, 0u, r);
+            root = new_root;
+            do_insert(root, key, data);
         } else {
             do_insert(r, key, data);
         }
@@ -45,7 +46,8 @@ public:
     void dump() const {
         if (!debug)
             return;
-        do_dump(root, "");
+        std::unordered_map<Key, bool> leafs_info;
+        do_dump(root, "", 1'000'000'000, leafs_info);
     }
 
     bool erase(const Key &key) {
@@ -136,10 +138,14 @@ protected:
         cell_ptr get_cell() {
             if (!current_idx) {
                 if (debug)
-                    fmt::print("set_internal: full page\n");
+                    fmt::print("get_cell: full page\n");
                 return nullptr;
             }
-            return availibility_list[--current_idx];
+            auto next_cell = availibility_list[--current_idx];
+            if (debug) {
+                availibility_list[current_idx] = nullptr;
+            }
+            return next_cell;
         }
 
         void set_internal(unsigned i, const Key &key, const Data &data) {
@@ -167,7 +173,11 @@ protected:
         }
 
         void remove(unsigned i) {
+            if (debug) {
+                assert(availibility_list[current_idx] == nullptr);
+            }
             availibility_list[current_idx++] = offsets[i];
+            offsets[i] = nullptr;
             header.cells_size--;
         }
 
@@ -183,8 +193,8 @@ protected:
             fmt::print("do_search: {}\n", key);
         auto size = node->size();
         auto &data = node->offsets;
-        // data are sorted
-        if (size < binary_search_threshold) [[likely]] {
+        // data are sorted, FIXME: temporary disabled binary search
+        if (true || size < binary_search_threshold) [[likely]] {
             // for now just naive scan
             auto i = 0u;
             for (; (i < size) && (key > data[i]->key); i++) {}
@@ -217,7 +227,7 @@ protected:
 
     void do_insert(page *node, const Key &key, const Data &value) {
         if (debug)
-            fmt::print("do_insert: {}\n", key);
+            fmt::print("do_insert: {} to {}\n", key, (void*)node);
         auto &data = node->offsets;
         auto i = node->size();
         if (node->is_leaf()) {
@@ -241,14 +251,14 @@ protected:
             }
         }
         do_insert(next_page, key, value);
-        if (!splitted)
-            data[i]->key = std::max(data[i]->key, key);
-
+        data[i]->key = std::max(data[i]->key, key);
     }
     // x - parent of full y, right half of y is moved to z - new child of x
     page* split_child(page *x, unsigned i, page *y, unsigned half = fanout/2) {
-        if (debug)
+        if (debug) {
             fmt::print("split_child index: {}\n", i);
+            assert(x->size() <= fanout && y->size() <= fanout);
+        }
         auto z = allocate_page(y->is_leaf());
         auto &x_data = x->offsets;
         auto &z_data = z->offsets;
@@ -265,17 +275,26 @@ protected:
         for (auto j = x->size(); j >= i + 1; j--) {
             x_data[j+1] = x_data[j];
         }
-        x->set(i+1, z_data[half - 1]->key, z);
-        x_data[i]->key = y_data[half - 1]->key;
+        if (!x->empty()) {
+            x->set(i+1, z_data[half - 1]->key, z);
+            x_data[i]->key = y_data[half - 1]->key;
+        } else {
+            x->set(i, y_data[half - 1]->key, y);
+            x->set(i+1, z_data[half - 1]->key, z);
+        }
         write(*x);
         write(*y);
         write(*z);
+        if (debug) {
+            assert(x->size() <= fanout && y->size() <= fanout && z->size() <= fanout);
+        }
         return z;
     }
 
     page *merge_child(page *parent, unsigned i, page *x, page *y, bool right) {
         if (debug)
-            fmt::print("merge_child index: {}\n", i);
+            fmt::print("merge_child: parent = {} i = {} x = {}, y = {} right = {}\n", (void*)parent, i,
+                       (void*)x, (void*)y, right);
         if (x != y) {
             auto &y_data = y->offsets;
             auto offset = x->size();
@@ -285,34 +304,44 @@ protected:
             }
         }
         auto &pdata = parent->offsets;
-        // when on right
         if (right) {
-            if (i + 1 < parent->size())
-                pdata[i]->key = pdata[i+1]->key;
-            for (auto j = i+1; j < parent->size() - 1; j++) {
+            auto new_key = pdata[i+1]->key;
+            parent->remove(i+1);
+            if (i < parent->size())
+                pdata[i]->key = new_key;
+            for (auto j = i+1; j < parent->size(); j++) {
                 pdata[j] = pdata[j+1];
             }
         } else {
             if (i > 0)
                 pdata[i-1]->key = pdata[i]->key;
-            for (auto j = i; j < parent->size() - 1; j++) {
+            parent->remove(i);
+            for (auto j = i; j < parent->size(); j++) {
                 pdata[j] = pdata[j+1];
             }
         }
         delete y;
-        parent->remove(i);
         return nullptr;
     }
 
-    void do_dump(page *node, std::string str) const {
+    void do_dump(page *node, std::string str, const Key &parent_key,
+                 std::unordered_map<Key, bool> &leafs_info) const {
         using namespace std::string_literals;
         fmt::print("{} {}: leaf = {}\n", str.c_str(), static_cast<void*>(node), node->is_leaf());
         str += "  "s;
+        auto &data = node->offsets;
         for (auto i = 0u; i < node->size(); i++) {
-            auto &data = node->offsets;
+            if (i + 1 < node->size())
+                assert(data[i]->key < data[i+1]->key);
             fmt::print("{} key = {}\n", str.c_str(), data[i]->key);
+            // verify
+            assert(data[i]->key <= parent_key);
             if (!node->is_leaf())
-                do_dump(node->get_internal_child(i), str);
+                do_dump(node->get_internal_child(i), str, data[i]->key, leafs_info);
+            else {
+                assert(!leafs_info.contains(data[i]->key));
+                leafs_info[data[i]->key] = true;
+            }
         }
     }
 
@@ -402,7 +431,8 @@ protected:
     }
 public:
     constexpr static auto fanout = debug? artificial_fanout : std::min(offsets_capacity,
-                                                                       std::min(cells_capacity, availibility_list_capacity));
+                                                                       std::min(cells_capacity,
+                                                                                availibility_list_capacity));
 private:
     constexpr static unsigned short binary_search_threshold = fanout/2;
     constexpr static unsigned short memory_limit_mb = 512u;
@@ -537,6 +567,40 @@ static auto test_inserts_with_erases_remove_tree(unsigned start) {
     }
 }
 
+static size_t get_random(size_t to) {
+    static std::random_device device;
+    static std::mt19937 generator(device());
+    std::uniform_int_distribution<> random(0, to);
+    return random(generator);
+}
+
+static auto test_huge_random_tree(unsigned size) {
+    btree_plus<size_t, size_t> tree;
+    std::map<size_t, size_t> map;
+    for (auto i = 0u; i < size; i++) {
+        auto item = get_random(10*size);
+        if (!map.contains(item)) {
+            map[item] = item;
+            tree.insert(item, item);
+        }
+    }
+    tree.dump();
+   // assert(tree.size() == map.size());
+    for (auto &&[key, value] : map) {
+        assert(*tree.search(key) == value);
+    }
+    for (auto i = 0u; i < size; i++) {
+        auto item = get_random(10*size);
+        auto erased = map.erase(item);
+        assert(tree.erase(item) == erased);
+    }
+    tree.dump();
+   // assert(tree.size() == map.size());
+    for (auto &&[key, value] : map) {
+        assert(*tree.search(key) == value);
+    }
+}
+
 int main() {
     test_basic_insert_search1();
     test_basic_insert_search2();
@@ -546,6 +610,7 @@ int main() {
     btree_plus_test<>{}.test_splits_and_merges();
     test_inserts_with_erases_remove_tree(4u);
     test_inserts_with_erases_remove_tree(3u);
+    test_huge_random_tree(10'000);
     fmt::print("OK\n");
     return 0;
 }
