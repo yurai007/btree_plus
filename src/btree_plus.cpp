@@ -61,7 +61,7 @@ public:
         do_delete(root);
     }
 
-    bool empty() const {
+    bool empty() const noexcept {
         return root->empty();
     }
 
@@ -188,26 +188,12 @@ protected:
 
     page *root;
 
-    const Data *do_search(const page *node, const Key &key) const noexcept {
-        if (debug)
-            fmt::print("do_search: {}\n", key);
-        auto size = node->size();
-        auto &data = node->offsets;
-        // data are sorted, FIXME: temporary disabled binary search
-        if (true || size < binary_search_threshold) [[likely]] {
-            // for now just naive scan
-            auto i = 0u;
+    unsigned lookup_offsets(unsigned size, const std::array<cell_ptr, offsets_capacity> &data,
+                            const Key &key) const {
+        auto i = 0u;
+        // data are sorted; depending on size we scan or binary search
+        if (size <= binary_search_threshold) [[likely]] {
             for (; (i < size) && (key > data[i]->key); i++) {}
-            if (i >= size)
-                return nullptr;
-            assert(key <= data[i]->key);
-            if (node->is_leaf() && data[i]->key == key) {
-                return node->get_data(i);
-            } else if (!node->is_leaf() && !node->empty()) {
-                auto next_page = read(node->get_internal_child(i));
-                return next_page? do_search(next_page, key) : nullptr;
-            }
-            return nullptr;
         } else {
             auto it = std::ranges::lower_bound(data.begin(), data.begin() + size, key, [](auto key1, auto key2){
                 return key1 < key2;
@@ -215,14 +201,27 @@ protected:
                 return cell_pointer->key;
             });
             assert(it != data.end());
-            auto i = static_cast<unsigned>(std::ranges::distance(data.begin(), it));
-            if (data[i]->key == key) {
-                return node->get_data(i);
-            } else {
-                auto next_page = read(node->get_internal_child(i));
-                return next_page? do_search(next_page, key) : nullptr;
-            }
+            i = static_cast<unsigned>(std::ranges::distance(data.begin(), it));
         }
+        return i;
+    }
+
+    const Data *do_search(const page *node, const Key &key) const noexcept {
+        if (debug)
+            fmt::print("do_search: {}\n", key);
+        auto size = node->size();
+        auto &data = node->offsets;
+        auto i = lookup_offsets(size, data, key);
+        if (i >= size)
+            return nullptr;
+        assert(key <= data[i]->key);
+        if (node->is_leaf() && data[i]->key == key) {
+            return node->get_data(i);
+        } else if (!node->is_leaf() && !node->empty()) {
+            auto next_page = read(node->get_internal_child(i));
+            return next_page? do_search(next_page, key) : nullptr;
+        }
+        return nullptr;
     }
 
     void do_insert(page *node, const Key &key, const Data &value) {
@@ -358,49 +357,43 @@ protected:
             fmt::print("do_erase: key={} pkey={}\n", key, parent_key);
         auto size = node->size();
         auto &data = node->offsets;
-        if (size < 20*binary_search_threshold) [[likely]] {
-            auto i = 0u;
-            for (; (i < size) && (key > data[i]->key); i++) {}
-            if (i >= size)
+        auto i = lookup_offsets(size, data, key);
+        if (i >= size)
+            return false;
+        assert(key <= data[i]->key);
+        if (node->is_leaf() && key == data[i]->key) {
+            node->remove(i);
+            for (auto j = i; j < size; j++) {
+                data[j] = data[j+1];
+            }
+            if (0 < i && i-1 < node->size() && key == parent_key)
+                parent_key = data[i-1]->key;
+            return true;
+        } else if (!node->is_leaf()) {
+            auto next_page = read(node->get_internal_child(i));
+            if (!next_page)
                 return false;
-            assert(key <= data[i]->key);
-            if (node->is_leaf() && key == data[i]->key) {
-                node->remove(i);
-                for (auto j = i; j < size; j++) {
-                    data[j] = data[j+1];
-                }
-                if (0 < i && i-1 < node->size() && key == parent_key)
-                    parent_key = data[i-1]->key;
-                return true;
-            } else if (!node->is_leaf()) {
-                auto next_page = read(node->get_internal_child(i));
-                if (!next_page)
-                    return false;
-                auto &mutable_key = data[i]->key;
-                auto erased = do_erase(next_page, key, mutable_key);
-                if (!erased)
-                    return false;
-                auto right_page = node->get_internal_child_at(i+1);
-                if (right_page && (next_page->size() + right_page->size() <= fanout)) {
-                    merge_child(node, i, next_page, right_page, true);
-                    return erased;
-                }
-                auto left_page = node->get_internal_child_at(i-1);
-                if (left_page && (left_page->size() + next_page->size() <= fanout)) {
-                    merge_child(node, i, left_page, next_page, false);
-                    return erased;
-                }
-                if (!left_page && !right_page) {
-                    if (node->size() == 1 && next_page->empty()) {
-                        node->remove(i);
-                        delete next_page;
-                    }
-                }
+            auto &mutable_key = data[i]->key;
+            auto erased = do_erase(next_page, key, mutable_key);
+            if (!erased)
+                return false;
+            auto right_page = node->get_internal_child_at(i+1);
+            if (right_page && (next_page->size() + right_page->size() <= fanout)) {
+                merge_child(node, i, next_page, right_page, true);
                 return erased;
             }
-            return false;
-        } else {
-            assert(false);
+            auto left_page = node->get_internal_child_at(i-1);
+            if (left_page && (left_page->size() + next_page->size() <= fanout)) {
+                merge_child(node, i, left_page, next_page, false);
+                return erased;
+            }
+            if (!left_page && !right_page) {
+                if (node->size() == 1 && next_page->empty()) {
+                    node->remove(i);
+                    delete next_page;
+                }
+            }
+            return erased;
         }
         return false;
     }
